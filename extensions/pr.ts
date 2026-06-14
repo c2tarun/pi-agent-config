@@ -1,5 +1,4 @@
-import { existsSync } from "node:fs";
-import { basename, join, resolve } from "node:path";
+import { basename, resolve } from "node:path";
 import { complete } from "@earendil-works/pi-ai";
 import type {
   ExtensionAPI,
@@ -10,6 +9,7 @@ type Repo = {
   path: string;
   name: string;
   changedFiles: number;
+  dirty: boolean;
 };
 
 type Args = {
@@ -40,16 +40,17 @@ function parseArgs(args: string): Args {
 
 function helpText() {
   return `Usage:
-  /pr                 Commit dirty repo(s), push branch(es), create/show PR(s)
-  /pr --rebase        Commit, fetch, rebase on base, force-with-lease, create/show PR(s)
+  /pr                 Commit dirty repo(s), rebase on base, push branch(es), create/show PR(s)
+  /pr --rebase        Same as /pr; kept for compatibility
   /pr --rebase-only   Commit, fetch, rebase on base, force-with-lease, no PR(s)
-  /pr --no-force      With --rebase, stop after rebase; do not force-push
+  /pr --no-force      Stop after rebase; do not force-push
   /pr --help          Show this help
 
 Behavior:
-  - Scans cwd and child git repos for dirty repos.
+  - Scans cwd and child git repos for dirty repos; if none are dirty, processes the current repo.
   - Processes all dirty repos found, with a confirmation when multiple repos are dirty.
   - Refuses base branches: detected base, main, master.
+  - Always rebases on the origin base branch before creating/showing PRs.
   - Rebase flow asks before rebase and before force-with-lease.
   - Rebase conflicts stop and print continue/abort commands.
 
@@ -122,6 +123,7 @@ async function scanRepos(
       path: abs,
       name: basename(abs),
       changedFiles: status.stdout.split("\n").filter(Boolean).length,
+      dirty: true,
     });
   }
   return repos;
@@ -133,8 +135,19 @@ async function chooseRepos(
 ): Promise<Repo[]> {
   const repos = await scanRepos(pi, ctx);
   if (repos.length === 0) {
-    ctx.ui.notify("/pr: no changed git repo found", "info");
-    return [];
+    const direct = await currentRepo(pi, ctx);
+    if (!direct) {
+      ctx.ui.notify("/pr: no git repo found", "info");
+      return [];
+    }
+    return [
+      {
+        path: resolve(direct),
+        name: basename(direct),
+        changedFiles: 0,
+        dirty: false,
+      },
+    ];
   }
   if (repos.length === 1) return repos;
   const summary = repos
@@ -431,17 +444,36 @@ async function createOrShowPr(
   branch: string,
   base: string,
 ) {
-  const open = await exec(
+  const existing = await exec(
     pi,
-    `cd ${sh(repo)} && gh pr view --json url,state --jq 'select(.state == "OPEN") | .url'`,
+    `cd ${sh(repo)} && gh pr view --json url,state --jq '.state + " " + .url'`,
     20_000,
   );
-  if (open.code === 0 && open.stdout) {
-    ctx.ui.notify(`/pr: open PR exists: ${open.stdout}`, "success");
-    return;
+  if (existing.code === 0 && existing.stdout) {
+    const [state, ...urlParts] = existing.stdout.split(/\s+/);
+    const url = urlParts.join(" ");
+    if (state === "OPEN") {
+      ctx.ui.notify(`/pr: open PR exists: ${url}`, "success");
+      return;
+    }
+    if (state === "MERGED" || state === "CLOSED") {
+      ctx.ui.notify(
+        `/pr: existing PR is ${state}; force-pushing branch before creating a new PR`,
+        "info",
+      );
+      const forcePush = await git(
+        pi,
+        repo,
+        "push -u origin HEAD --force-with-lease",
+        120_000,
+      );
+      if (forcePush.code !== 0)
+        throw new Error(`force push failed\n${forcePush.output}`);
+    }
+  } else {
+    const push = await git(pi, repo, "push -u origin HEAD", 120_000);
+    if (push.code !== 0) throw new Error(`push failed\n${push.output}`);
   }
-  const push = await git(pi, repo, "push -u origin HEAD", 120_000);
-  if (push.code !== 0) throw new Error(`push failed\n${push.output}`);
   const pr = await exec(
     pi,
     `cd ${sh(repo)} && gh pr create --base ${sh(base)} --head ${sh(branch)} --fill`,
@@ -454,7 +486,7 @@ async function createOrShowPr(
 export default function prExtension(pi: ExtensionAPI) {
   pi.registerCommand("pr", {
     description:
-      "Commit, optionally rebase safely, push, and create/show GitHub PRs for changed repo(s)",
+      "Commit, rebase safely, push, and create/show GitHub PRs for repo(s)",
     handler: async (rawArgs, ctx) => {
       await ctx.waitForIdle();
       const args = parseArgs(rawArgs || "");
@@ -479,12 +511,14 @@ export default function prExtension(pi: ExtensionAPI) {
             failed.push(repo.name);
             continue;
           }
-          if (args.rebase) {
-            const ok = await rebaseFlow(pi, ctx, repo.path, branch, base, args);
-            if (!ok) {
-              failed.push(repo.name);
-              continue;
-            }
+          const ok = await rebaseFlow(pi, ctx, repo.path, branch, base, args);
+          if (!ok) {
+            failed.push(repo.name);
+            continue;
+          }
+          if (args.noForce) {
+            succeeded += 1;
+            continue;
           }
           if (!args.rebaseOnly)
             await createOrShowPr(pi, ctx, repo.path, branch, base);
